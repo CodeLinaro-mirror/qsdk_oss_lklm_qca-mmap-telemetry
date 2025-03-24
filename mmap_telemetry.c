@@ -60,7 +60,7 @@ static int mmap_telemetry_uio_release(struct uio_info *info, struct inode *inode
  */
 static irqreturn_t mmap_telemetry_uio_irq_handler(int irq, struct uio_info *info)
 {
-	pr_info("irq: %d.", irq);
+	DEBUG_INFO("irq: %d.", irq);
 
 	return IRQ_HANDLED;
 }
@@ -89,7 +89,7 @@ static int mmap_telemetry_mmap(struct uio_info *info, struct vm_area_struct *vma
 			vma->vm_end - vma->vm_start, vma->vm_page_prot);
 	if (ret) {
 		/* Error Handle */
-		pr_warn("remap_pfn_range failed");
+		DEBUG_WARN("remap_pfn_range failed");
 	}
 
 	return ret;
@@ -116,14 +116,14 @@ void *mmap_telemetry_alloc_mem(enum mmap_telemetry_uio_dev_category dev_type, in
 	unsigned long flags;
 
 	if (is_coherent) {
-		pr_warn("Not supported. \n");
+		DEBUG_WARN("Not supported. \n");
 		return NULL;
 	}
 
 	map_size = mmap_telemetry_round_up_to_page_size(map_size);
 	memory = kzalloc(map_size, GFP_KERNEL);
 	if (!memory) {
-		pr_warn("Memory allocation failed for %s telemetry. \n", mmap_telemetry_mem_type_str[dev_type][map_type]);
+		DEBUG_WARN("Memory allocation failed for %s telemetry. \n", mmap_telemetry_mem_type_str[dev_type][map_type]);
 		return NULL;
 	}
 
@@ -303,7 +303,7 @@ static int __init mmap_telemetry_init(void)
 		for (map_type = 0; map_type < num_maps; map_type++) {
 			memory = kzalloc(PAGE_SIZE, GFP_KERNEL);
 			if (!memory) {
-				pr_warn("Memory allocation failed for telemetry. \n");
+				DEBUG_WARN("Memory allocation failed for telemetry. \n");
 				mmap_telemetry_cleanup_mem();
 				return -ENOMEM;
 			}
@@ -315,7 +315,7 @@ static int __init mmap_telemetry_init(void)
 	for (dev_type = 0; dev_type < MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX; dev_type++) {
 		info = kzalloc(sizeof(struct uio_info), GFP_KERNEL);
 		if (!info) {
-			pr_warn("Failed to allocate meory for uio info.\n");
+			DEBUG_WARN("Failed to allocate meory for uio info.\n");
 			mmap_telemetry_cleanup_uio();
 			mmap_telemetry_cleanup_mem();
 			return -ENOMEM;
@@ -365,7 +365,7 @@ static int __init mmap_telemetry_init(void)
 
 		ret = device_register(dev);
 		if (ret) {
-			pr_warn("Failed to register the telemetry uio device.\n");
+			DEBUG_WARN("Failed to register the telemetry uio device.\n");
 			mmap_telemetry_dev_unregister(dev_type);
 			mmap_telemetry_cleanup_dev();
                         mmap_telemetry_cleanup_uio();
@@ -387,7 +387,7 @@ static int __init mmap_telemetry_init(void)
 			return -ENOMEM;
 		}
 
-		pr_info("Registered UIO handler %s\n", mmap_telemetry_uio_dev_category_str[dev_type]);
+		DEBUG_INFO("Registered UIO handler %s\n", mmap_telemetry_uio_dev_category_str[dev_type]);
 	}
 
 	return 0;

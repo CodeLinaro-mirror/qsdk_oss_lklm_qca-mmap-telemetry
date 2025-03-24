@@ -12,4 +12,4 @@ obj-m += mmap-telemetry.o
 #
 mmap-telemetry-objs := $(MMAP_TELEMETRY_BASE_OBJS)
 
-ccflags-y += -Werror -Wall -I$(obj) -I$(obj)/exports
+ccflags-y += -Werror -Wall -I$(obj) -I$(obj)/exports -DDEBUG_LEVEL=3
