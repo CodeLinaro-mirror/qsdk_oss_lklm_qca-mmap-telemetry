@@ -1,31 +1,36 @@
 /*
- **************************************************************************
- * Copyright (c) 2025 Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * Permission to use, copy, modify, and/or distribute this software for
- * any purpose with or without fee is hereby granted, provided that the
- * above copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
- * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- **************************************************************************
- */
+**************************************************************************
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
+**************************************************************************
+*/
 
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/uio_driver.h>
 #include <linux/mm.h>
-
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/uaccess.h>
+#include <linux/notifier.h>
+#include <linux/err.h>
+#include <linux/version.h>
+#include <linux/major.h>
+#include <linux/atomic.h>
+#include <asm/barrier.h>
 #include "mmap_telemetry.h"
+
+static struct class *dump_class;
+static int dump_major;
 
 static struct mmap_telemetry_uio_info info_global[MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX];
 static struct device *dev_global[MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX];
 static void *mem[MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX][MAX_UIO_MAPS] = {0};
+
+/*
+ * Define the custom notifier chain
+ */
+static struct blocking_notifier_head notifier_chains[MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX][MAX_UIO_MAPS];
 
 /*
  * mmap_telemetry_release
@@ -88,7 +93,9 @@ static int mmap_telemetry_mmap(struct uio_info *info, struct vm_area_struct *vma
 	ret = remap_pfn_range(vma, vma->vm_start, pfn,
 			vma->vm_end - vma->vm_start, vma->vm_page_prot);
 	if (ret) {
-		/* Error Handle */
+		/*
+		 * Error Handle
+		 */
 		DEBUG_WARN("remap_pfn_range failed");
 	}
 
@@ -108,11 +115,11 @@ static size_t mmap_telemetry_round_up_to_page_size(size_t size)
  * mmap_telemetry_alloc_mem
  * 	Allocate the mmap memory.
  */
-void *mmap_telemetry_alloc_mem(enum mmap_telemetry_uio_dev_category dev_type, int map_type, unsigned long map_size, bool is_coherent)
+void *mmap_telemetry_alloc_mem(enum mmap_telemetry_uio_dev_category dev_type,
+			int map_type, unsigned long map_size, bool is_coherent)
 {
 	void *memory;
 	struct uio_info *info = info_global[dev_type].info;
-	int i;
 	unsigned long flags;
 
 	if (is_coherent) {
@@ -138,9 +145,7 @@ void *mmap_telemetry_alloc_mem(enum mmap_telemetry_uio_dev_category dev_type, in
 	info->mem[map_type].memtype = UIO_MEM_LOGICAL;
 	info->mem[map_type].name = mmap_telemetry_mem_type_str[dev_type][map_type];
 
-	for (i = 0; i < map_type; i++){
-		info->mem[map_type].offs += info->mem[i].size;
-	}
+	mem[dev_type][map_type] = memory;
 
 	spin_unlock_irqrestore(&info_global[dev_type].uio_lock, flags);
         return memory;
@@ -191,6 +196,150 @@ void mmap_telemetry_free_mem(enum mmap_telemetry_uio_dev_category dev_type, int 
 EXPORT_SYMBOL(mmap_telemetry_free_mem);
 
 /*
+ * mmap_telemetry_ring_buffer_init
+ *	Initialize the ring buffer
+ */
+static void mmap_telemetry_ring_buffer_init(struct mmap_telemetry_ring_buffer *rb)
+{
+	memset(rb->buffer, 0, sizeof(rb->buffer));
+
+	atomic_set(&rb->front, 0);
+	atomic_set(&rb->rear, 0);
+}
+
+/*
+ * mmap_telemetry_ring_buffer_enqueue
+ *	Enqueue the ring buffer
+ */
+static bool __maybe_unused mmap_telemetry_ring_buffer_enqueue(struct mmap_telemetry_ring_buffer *rb,
+			int dev_type, int map_type, uint32_t offset, uint32_t size)
+{
+	int front;
+	int next_rear;
+	int rear;
+	struct mmap_telemetry_intr_data data;
+
+	if (!rb) {
+		DEBUG_WARN("ring buffer is NULL");
+		return false;
+	}
+
+	/*
+	 * Read memory barrier
+	 */
+	smp_rmb();
+	rear = atomic_read(&rb->rear);
+	front = atomic_read(&rb->front);
+	next_rear = (rear + 1) % RING_SIZE;
+
+	/*
+	 * Check if queue is full
+	 */
+	if (next_rear == front) {
+		DEBUG_WARN("ring buffer is full");
+		return false;
+	}
+
+	data.uioId = dev_type;
+	data.mapId = map_type;
+	data.offset_from_base = offset;
+	data.size_in_bytes_to_read = size;
+
+	memcpy(&rb->buffer[rear], &data, sizeof(struct mmap_telemetry_intr_data));
+
+	/*
+	 * Ensure the data is visible before updating rear
+	 */
+	smp_wmb();
+
+	/*
+	 * Advance rear pointer
+	 */
+	atomic_set(&rb->rear, next_rear);
+	smp_wmb();
+
+	return true;
+}
+
+/*
+ * mmap_telemetry_ioctl
+ *	Handle ioctl messages from the userspace
+ */
+static long mmap_telemetry_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct mmap_telemetry_intr_data data;
+	struct uio_info *info;
+
+	switch (cmd) {
+	case IOCTL_SEND_INTERRUPT:
+		if (copy_from_user((void *)(uintptr_t)&data, (void __user *)arg, sizeof(data))) {
+			DEBUG_WARN("Data copy from user failed.");
+			return -EFAULT;
+		}
+
+		DEBUG_INFO("Received ioctl for mapId: %d, uioId: %d\n", data.mapId, data.uioId);
+		info = info_global[data.uioId].info;
+
+		if (!info->mem[data.mapId].name) {
+			DEBUG_WARN("Wrong Map Id.");
+			return -ENOTTY;
+		}
+
+		blocking_notifier_call_chain(&notifier_chains[data.uioId][data.mapId], 0, (void *)data.payload.raw);
+		break;
+
+	default:
+		DEBUG_WARN("Ioctl command not found.");
+		return -ENOTTY;
+	}
+
+	return 0;
+}
+
+/*
+ * mmap_telemetry_notify
+ *	Notify when data is written
+ */
+int mmap_telemetry_notify(enum mmap_telemetry_uio_dev_category dev_type,
+				int map_type, uint32_t offset, uint32_t size)
+{
+	struct uio_info *info;
+	void *addr = NULL;
+
+	info = info_global[0].info;
+	addr = phys_to_virt(info->mem[0].addr);
+	if (!mmap_telemetry_ring_buffer_enqueue((struct mmap_telemetry_ring_buffer *)addr, dev_type,map_type, offset,size)) {
+		DEBUG_WARN("Ring buffer enqueue failed.");
+		return -1;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL(mmap_telemetry_notify);
+
+/*
+ * mmap_telemetry_register_notifier()
+ *      Register to received mmap telemetry events.
+ */
+int mmap_telemetry_register_notifier(struct notifier_block *nb,
+				enum mmap_telemetry_uio_dev_category dev_type, int map_type)
+{
+	return blocking_notifier_chain_register(&notifier_chains[dev_type][map_type], nb);
+}
+EXPORT_SYMBOL(mmap_telemetry_register_notifier);
+
+/*
+ * mmap_telemetry_unregister_notifier()
+ *      Unregister to received mmap telemetry events.
+ */
+int mmap_telemetry_unregister_notifier(struct notifier_block *nb,
+			enum mmap_telemetry_uio_dev_category dev_type, int map_type)
+{
+	return blocking_notifier_chain_unregister(&notifier_chains[dev_type][map_type], nb);
+}
+EXPORT_SYMBOL(mmap_telemetry_unregister_notifier);
+
+/*
  * mmap_telemetry_cleanup_mem
  *	Clean up the uio map memory
  */
@@ -206,6 +355,7 @@ static void mmap_telemetry_cleanup_mem(void)
 		for (map_type = 0; map_type < num_maps; map_type++) {
 			if(mem[dev_type][map_type]) {
 				kfree(mem[dev_type][map_type]);
+				mem[dev_type][map_type] = NULL;
 			}
 		}
 
@@ -285,18 +435,44 @@ static void mmap_telemetry_uio_unregister(enum mmap_telemetry_uio_dev_category d
 	}
 }
 
+static const struct file_operations fops = {
+	.owner = THIS_MODULE,
+	.unlocked_ioctl = mmap_telemetry_ioctl
+};
+
+/*
+ * mmap_telemetry_exit
+ *	Deinitialize the mmap telemetry module.
+ */
+static void __exit mmap_telemetry_exit(void)
+{
+	device_destroy(dump_class, MKDEV(dump_major, 0));
+	class_destroy(dump_class);
+	unregister_chrdev(dump_major, DEVICE_NAME);
+	mmap_telemetry_uio_unregister(MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX);
+	mmap_telemetry_dev_unregister(MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX);
+	mmap_telemetry_cleanup_dev();
+	mmap_telemetry_cleanup_uio();
+	mmap_telemetry_cleanup_mem();
+}
+
 /*
  * mmap_telemetry_init
  * 	Initialize the mmap telemetry module.
  */
 static int __init mmap_telemetry_init(void)
 {
-	int ret, dev_type, map_type;
+	int ret = 0;
+	int dev_type, map_type;
 	int num_maps;
 	struct uio_info *info;
 	struct device *dev;
 	void *memory;
+	struct device *dump_dev;
 
+	/*
+	 * Allocate the uio maps.
+	 */
 	for (dev_type = 0; dev_type < MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX; dev_type++) {
 		num_maps = mmap_telemetry_num_maps_per_category[dev_type];
 
@@ -304,21 +480,23 @@ static int __init mmap_telemetry_init(void)
 			memory = kzalloc(PAGE_SIZE, GFP_KERNEL);
 			if (!memory) {
 				DEBUG_WARN("Memory allocation failed for telemetry. \n");
-				mmap_telemetry_cleanup_mem();
-				return -ENOMEM;
+				ret = -ENOMEM;
+				goto clean_uio_map;
 			}
 
 			mem[dev_type][map_type] = memory;
 		}
 	}
 
+	/*
+	 * Allocate the uio info structures
+	 */
 	for (dev_type = 0; dev_type < MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX; dev_type++) {
 		info = kzalloc(sizeof(struct uio_info), GFP_KERNEL);
 		if (!info) {
 			DEBUG_WARN("Failed to allocate meory for uio info.\n");
-			mmap_telemetry_cleanup_uio();
-			mmap_telemetry_cleanup_mem();
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto clean_uio_info;
 		}
 
 		info->name = mmap_telemetry_uio_dev_category_str[dev_type];
@@ -344,13 +522,14 @@ static int __init mmap_telemetry_init(void)
 		spin_lock_init(&info_global[dev_type].uio_lock);
 	}
 
+	/*
+	 * Allocate the uio devices.
+	 */
 	for (dev_type = 0; dev_type < MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX; dev_type++) {
 		dev = kzalloc(sizeof(struct device), GFP_KERNEL);
 		if (!dev) {
-			mmap_telemetry_cleanup_dev();
-			mmap_telemetry_cleanup_uio();
-			mmap_telemetry_cleanup_mem();
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto clean_uio_dev;
 		}
 
 		dev_set_name(dev, mmap_telemetry_uio_dev_category_str[dev_type]);
@@ -360,6 +539,9 @@ static int __init mmap_telemetry_init(void)
 		dev_global[dev_type] = dev;
 	}
 
+	/*
+	 * Register the devices.
+	 */
 	for (dev_type = 0; dev_type < MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX; dev_type++) {
 		dev = dev_global[dev_type];
 
@@ -367,43 +549,99 @@ static int __init mmap_telemetry_init(void)
 		if (ret) {
 			DEBUG_WARN("Failed to register the telemetry uio device.\n");
 			mmap_telemetry_dev_unregister(dev_type);
-			mmap_telemetry_cleanup_dev();
-                        mmap_telemetry_cleanup_uio();
-                        mmap_telemetry_cleanup_mem();
-			return ret;
+			goto clean_uio_dev;
 		}
 	}
 
+	/*
+	 * Register the uio devices.
+	 */
 	for (dev_type = 0; dev_type < MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX; dev_type++) {
 		info = info_global[dev_type].info;
 		dev = dev_global[dev_type];
 
 		if (uio_register_device(dev, info) < 0) {
+			ret = -ENOMEM;
 			mmap_telemetry_uio_unregister(dev_type);
-			mmap_telemetry_dev_unregister(MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX);
-			mmap_telemetry_cleanup_dev();
-			mmap_telemetry_cleanup_uio();
-			mmap_telemetry_cleanup_mem();
-			return -ENOMEM;
+			goto uio_dev_reg_failed;
 		}
 
 		DEBUG_INFO("Registered UIO handler %s\n", mmap_telemetry_uio_dev_category_str[dev_type]);
 	}
 
-	return 0;
-}
+	/*
+	 * Initialize the notifier chains
+	 */
+	for (dev_type = 0; dev_type < MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX; dev_type++) {
+		for (map_type = 0; map_type < MAX_UIO_MAPS; map_type++) {
+			BLOCKING_INIT_NOTIFIER_HEAD(&notifier_chains[dev_type][map_type]);
+			DEBUG_INFO("Notifier chain [%d][%d] initialized\n", dev_type, map_type);
+		}
+	}
 
-/*
- * mmap_telemetry_exit
- * 	Deinitialize the mmap telemetry module.
- */
-static void __exit mmap_telemetry_exit(void)
-{
+	/*
+	 * Register char device
+	 */
+	dump_major = register_chrdev(UNNAMED_MAJOR, DEVICE_NAME, &fops);
+	if (dump_major < 0) {
+		ret = dump_major;
+		pr_err("Unable to allocate a major number err = %d\n", ret);
+		goto uio_info_reg_failed;
+	}
+
+	dump_class = class_create(CLASS_NAME);
+
+	if (IS_ERR(dump_class)) {
+		ret = PTR_ERR(dump_class);
+		pr_err("Unable to create dump class = %d\n", ret);
+		goto class_failed;
+	}
+
+	/*
+	 * Create char device
+	 */
+	dump_dev = device_create(dump_class, NULL, MKDEV(dump_major, 0), NULL, DEVICE_NAME);
+	if (IS_ERR(dump_dev)) {
+		ret = PTR_ERR(dump_dev);
+		pr_err("Unable to create a device err = %d\n", ret);
+		goto device_failed;
+	}
+
+	/*
+	 * Resize mmap for interrupt handling
+	 */
+	if (!mmap_telemetry_alloc_mem(MMAP_TELEMETRY_UIO_DEV_CATEGORY_SXC, MMAP_TELEMETRY_MEM_TYPE_INTERRUPT, INTERRUPT_MAP_SIZE, false)) {
+		pr_err("Unable to allocate map for interrupt\n");
+		ret  = -1;
+		device_destroy(dump_class, MKDEV(dump_major, 0));
+		goto device_failed;
+	}
+
+	info = info_global[0].info;
+	memory = phys_to_virt(info->mem[0].addr);
+
+	/*
+	 * Initialize interrupt ring buffer
+	 */
+	mmap_telemetry_ring_buffer_init((struct mmap_telemetry_ring_buffer *)memory);
+
+	return 0;
+
+device_failed:
+	class_destroy(dump_class);
+class_failed:
+	unregister_chrdev(dump_major, DEVICE_NAME);
+uio_info_reg_failed:
 	mmap_telemetry_uio_unregister(MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX);
+uio_dev_reg_failed:
 	mmap_telemetry_dev_unregister(MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX);
+clean_uio_dev:
 	mmap_telemetry_cleanup_dev();
+clean_uio_info:
 	mmap_telemetry_cleanup_uio();
+clean_uio_map:
 	mmap_telemetry_cleanup_mem();
+	return ret;
 }
 
 module_init(mmap_telemetry_init);
