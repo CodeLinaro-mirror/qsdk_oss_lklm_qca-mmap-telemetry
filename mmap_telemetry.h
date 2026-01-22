@@ -16,6 +16,8 @@
 #define RING_SIZE 64
 #define INTERRUPT_MAP_SIZE 32768
 
+#define WLFW_MAP_SIZE ((128 * 1024)*2)  //for 2 PDEV each 128K
+
 #define DEVICE_NAME "mmap_telemetry_char_dev"
 #define CLASS_NAME  "mmap_telemetry_class"
 #define IOCTL_SEND_INTERRUPT _IOW('u', 1, struct mmap_telemetry_intr_data)
@@ -97,14 +99,16 @@ struct mmap_telemetry_ring_buffer {
         struct mmap_telemetry_intr_data buffer[RING_SIZE];	/* Interrupt data */
 };
 
-int mmap_telemetry_num_maps_per_category[MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX] = {MMAP_TELEMETRY_MEM_TYPE_SXC_MAX};	/* To store number of maps per UIO device */
+int mmap_telemetry_num_maps_per_category[MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX] = {MMAP_TELEMETRY_MEM_TYPE_SXC_MAX,
+                                                                                 MMAP_TELEMETRY_MEM_TYPE_WLFW_MAX};	/* To store number of maps per UIO device */
 
 /*
  * mmap_telemetry_uio_dev_category_str
  *	mmap telemetry uio device category strings
  */
 const char* mmap_telemetry_uio_dev_category_str[MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX] = {
-	"sxc"
+	"sxc",
+	"wlfw"
 };
 
 /*
@@ -113,6 +117,7 @@ const char* mmap_telemetry_uio_dev_category_str[MMAP_TELEMETRY_UIO_DEV_CATEGORY_
  */
 const char* mmap_telemetry_mem_type_str[MMAP_TELEMETRY_UIO_DEV_CATEGORY_MAX][MAX_UIO_MAPS] = {
 	{"interrupt", "sac", "sdc"},
+	{"wlfw0", "wlfw1", "wlfw2", "wlfw3"},
 };
 
 /*

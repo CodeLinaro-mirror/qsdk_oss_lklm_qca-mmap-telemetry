@@ -608,13 +608,25 @@ static int __init mmap_telemetry_init(void)
 	}
 
 	/*
-	 * Resize mmap for interrupt handling
+	 * Resize mmap for sxc interrupt handling
 	 */
 	if (!mmap_telemetry_alloc_mem(MMAP_TELEMETRY_UIO_DEV_CATEGORY_SXC, MMAP_TELEMETRY_MEM_TYPE_INTERRUPT, INTERRUPT_MAP_SIZE, false)) {
-		pr_err("Unable to allocate map for interrupt\n");
-		ret  = -1;
+		pr_err("Unable to allocate map for sxc interrupt\n");
+		ret = -ENOMEM;
 		device_destroy(dump_class, MKDEV(dump_major, 0));
 		goto device_failed;
+	}
+
+	/*
+	 * Allocate mmap for all wlfw devices
+	 */
+	for (map_type = MMAP_TELEMETRY_MEM_TYPE_WLFW0; map_type < MMAP_TELEMETRY_MEM_TYPE_WLFW_MAX; map_type++) {
+		if (!mmap_telemetry_alloc_mem(MMAP_TELEMETRY_UIO_DEV_CATEGORY_WLFW, map_type, WLFW_MAP_SIZE, false)) {
+			pr_err("Unable to allocate map for wlfw%d interrupt\n", map_type - MMAP_TELEMETRY_MEM_TYPE_WLFW0);
+			ret = -ENOMEM;
+			device_destroy(dump_class, MKDEV(dump_major, 0));
+			goto device_failed;
+		}
 	}
 
 	info = info_global[0].info;
