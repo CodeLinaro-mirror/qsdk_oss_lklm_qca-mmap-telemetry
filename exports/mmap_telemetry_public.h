@@ -18,6 +18,7 @@
  */
 typedef enum mmap_telemetry_uio_dev_category {
 	MMAP_TELEMETRY_UIO_DEV_CATEGORY_SXC,		/* UIO device for SXC statistics. */
+	MMAP_TELEMETRY_UIO_DEV_CATEGORY_WLFW,	        /* UIO device for WLAN FW statistics. */
 	/*
 	 * Please add the new devices here.
 	 */
@@ -34,6 +35,13 @@ typedef enum  mmap_telemetry_mem_type_sxc {
 	MMAP_TELEMETRY_MEM_TYPE_SXC_MAX		/* Indicates the last item. */
 } mmap_telemetry_mem_type_sxc;
 
+typedef enum  mmap_telemetry_mem_type_wlfw {
+	MMAP_TELEMETRY_MEM_TYPE_WLFW0,		/* Memory map for wlan firmware statistics.*/
+	MMAP_TELEMETRY_MEM_TYPE_WLFW1,		/* Memory map for wlan firmware statistics.*/
+	MMAP_TELEMETRY_MEM_TYPE_WLFW2,		/* Memory map for wlan firmware statistics.*/
+	MMAP_TELEMETRY_MEM_TYPE_WLFW3,		/* Memory map for wlan firmware statistics.*/
+	MMAP_TELEMETRY_MEM_TYPE_WLFW_MAX	/* Indicates the last item. */
+} mmap_telemetry_mem_type_wlfw;
 /**
  * Allocate mmap telemetry memory map.
  *
