@@ -189,6 +189,9 @@ void mmap_telemetry_free_mem(enum mmap_telemetry_uio_dev_category dev_type, int 
 	if (info->mem[map_type].name) {
 		kfree(phys_to_virt(info->mem[map_type].addr));
 		info->mem[map_type].name = NULL;
+		info->mem[map_type].addr = 0;
+		info->mem[map_type].size = 0;
+		mem[dev_type][map_type] = NULL;
 	}
 
 	spin_unlock_irqrestore(&info_global[dev_type].uio_lock, flags);
